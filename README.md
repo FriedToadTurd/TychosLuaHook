@@ -1,4 +1,5 @@
 # Poker Night Lua Hook via dinput8 Proxy Architecture
+Binary release can be downloaded on [Nexusmods](https://www.nexusmods.com/pokernightattheinventory/mods/17)
 
 ## How the DLL Gets Loaded
 
