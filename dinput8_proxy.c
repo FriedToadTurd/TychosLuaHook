@@ -511,6 +511,13 @@ static const char *expand_command(const char *input, char *outbuf, size_t outbuf
 
 static void console_repl(void) {
     AllocConsole();
+    /* Windows 11 / Windows Terminal: the console window can be created but
+       remain hidden or minimised.  Force it visible. */
+    HWND hwnd = GetConsoleWindow();
+    if (hwnd) {
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+    }
     freopen("CONIN$",  "r", stdin);
     freopen("CONOUT$", "w", stdout);
 
@@ -587,10 +594,18 @@ static DWORD WINAPI worker_thread(LPVOID param) {
     log_write("[dinput8_proxy] DLL loaded (pid %lu), scanning for lua_State...",
               (unsigned long)GetCurrentProcessId());
 
-    scan_for_lua_state();
+    /* Retry loop: the game initialises its Lua state some time after startup.
+       Scan every 500 ms for up to 15 s (30 attempts) before giving up. */
+    for (int attempt = 0; attempt < 30 && !g_L; attempt++) {
+        if (attempt > 0) {
+            log_write("[dinput8_proxy] lua_State not found, retrying (%d/30)...", attempt + 1);
+            Sleep(500);
+        }
+        scan_for_lua_state();
+    }
 
     if (!g_L) {
-        log_write("[dinput8_proxy] lua_State not found — aborting");
+        log_write("[dinput8_proxy] lua_State not found after 30 attempts — aborting");
         return 0;
     }
 
