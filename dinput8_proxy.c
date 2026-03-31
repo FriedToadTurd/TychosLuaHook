@@ -72,6 +72,10 @@ static volatile LONG g_code_pending = 0;
 static volatile char g_pending_code[1024];
 static volatile LONG g_result_ready  = 0;
 static volatile char g_result[1024];
+/* Incremented on every hook invocation regardless of pending code.
+   exec_lua uses this to distinguish "hook truly lost" (heartbeat unchanged)
+   from "hook alive but stuck in wrong context" (heartbeat advancing but no result). */
+static volatile LONG g_hook_heartbeat = 0;
 
 /* -------------------------------------------------------------------------
  * Logging — writes to dinput8_proxy.log next to dinput8.dll
@@ -230,14 +234,14 @@ static int rescan_and_rehook(void);
 
 static void count_hook(lua_State *L, lua_Debug *ar) {
     (void)ar;
+
+    /* Always tick heartbeat so exec_lua can detect the hook is alive. */
+    InterlockedIncrement(&g_hook_heartbeat);
+
     if (!g_code_pending) return;
 
-    /* MemoryBarrier ensures we read g_pending_code *after* the REPL thread's
-       MemoryBarrier+g_code_pending=1 sequence — i.e. we see the complete
-       buffer write that preceded the flag set. */
+    /* Commit to this invocation. */
     MemoryBarrier();
-
-    /* Copy code locally; clear the flag so the REPL thread can queue next cmd */
     char code[1024];
     strncpy(code, (const char *)g_pending_code, sizeof(code) - 1);
     code[sizeof(code) - 1] = '\0';
@@ -255,33 +259,31 @@ static void count_hook(lua_State *L, lua_Debug *ar) {
     }
     /* Stack: [chunk] */
 
-    /* Inherit _ENV from the hooked function so that game globals are visible.
+    /* Inherit _ENV from the game's call stack so that game globals are visible.
      *
      * Telltale runs game scripts in a sandboxed _ENV table, not in _G.
-     * kPlayer_Player, GameObject, etc. live in that env, not _G.
-     * luaL_loadstring sets the chunk's _ENV upvalue to _G by default;
-     * we replace it with the _ENV of whatever function was executing
-     * when the hook fired — that function is already in the game's env.
+     * luaL_loadstring sets the chunk's _ENV upvalue to _G by default.
      *
-     * lua_getstack(L, 1) = the Lua function that triggered the hook.
-     * Its upvalue 1 is _ENV in any Lua 5.2 chunk/closure.
-     */
-    lua_Debug hook_ar;
-    if (lua_getstack(L, 1, &hook_ar) && lua_getinfo(L, "f", &hook_ar)) {
-        /* Stack: [chunk] [hooked_fn] */
+     * Level 1 is usually the right function, but some frames interpose a
+     * callback wrapper whose first upvalue is something other than _ENV
+     * (e.g. bRunningCallbacks).  Walk up to 5 levels to find the innermost
+     * frame that actually carries _ENV, and use that.  If none is found we
+     * fall back to _G (the chunk default) — commands that guard with
+     * "if GameObject then" will still no-op safely. */
+    for (int lvl = 1; lvl <= 5; lvl++) {
+        lua_Debug env_ar;
+        if (!lua_getstack(L, lvl, &env_ar)) break;
+        if (!lua_getinfo(L, "f", &env_ar)) break;
+        /* Stack: [chunk] [fn] */
         const char *upname = lua_getupvalue(L, -1, 1);
-        log_write("[hook] upvalue[0] name: %s", upname ? upname : "NULL");
-        if (upname) {
-            /* Stack: [chunk] [hooked_fn] [upvalue] */
-            if (strcmp(upname, "_ENV") == 0) {
-                /* Replace chunk's upvalue 1 (_ENV) with hooked fn's _ENV */
-                lua_setupvalue(L, -3, 1);
-                /* Stack: [chunk] [hooked_fn] */
-            } else {
-                lua_pop(L, 1); /* upvalue wasn't _ENV, discard it */
-            }
+        if (upname && strcmp(upname, "_ENV") == 0) {
+            /* Stack: [chunk] [fn] [_ENV] */
+            lua_setupvalue(L, -3, 1);  /* set chunk upvalue 1 = _ENV, pops value */
+            lua_pop(L, 1);             /* pop fn → [chunk] */
+            break;
         }
-        lua_pop(L, 1); /* pop hooked_fn */
+        if (upname) lua_pop(L, 1);  /* pop upvalue (not _ENV) */
+        lua_pop(L, 1);              /* pop fn */
     }
     /* Stack: [chunk] */
 
@@ -353,19 +355,32 @@ static int exec_lua(const char *code, char *errbuf, size_t errbuf_sz) {
     MemoryBarrier();    /* buffer write must be visible before flag is set */
     InterlockedExchange(&g_code_pending, 1);
 
+    /* Snapshot heartbeat before waiting — used below to distinguish failure modes. */
+    LONG hb_before = g_hook_heartbeat;
+
     /* Wait up to 5 s (500 x 10 ms) for the hook to execute the command */
     for (int i = 0; i < 500 && !g_result_ready; i++)
         Sleep(10);
 
     if (!g_result_ready) {
-        /* Hook stopped firing — game likely started a new round and reset its
-           Lua state, clearing our installed hook.  Attempt auto-recovery. */
         InterlockedExchange(&g_code_pending, 0);  /* discard the stale pending cmd */
-        int recovered = rescan_and_rehook();
-        if (errbuf && errbuf_sz)
-            snprintf(errbuf, errbuf_sz, recovered
-                ? "hook lost; reconnected -- retry"
-                : "hook lost; rescan failed -- wait and retry");
+
+        if (g_hook_heartbeat != hb_before) {
+            /* Heartbeat advanced: hook is alive but every invocation was in a
+               wrong Lua context (e.g. bRunningCallbacks).  Don't recover —
+               the game is likely in a brief callback-heavy phase.  Tell the
+               user to retry in a moment. */
+            if (errbuf && errbuf_sz)
+                snprintf(errbuf, errbuf_sz, "hook busy (wrong context); retry shortly");
+        } else {
+            /* Heartbeat unchanged: hook truly stopped firing — Lua state was
+               reset.  Attempt auto-recovery. */
+            int recovered = rescan_and_rehook();
+            if (errbuf && errbuf_sz)
+                snprintf(errbuf, errbuf_sz, recovered
+                    ? "hook lost; reconnected -- retry"
+                    : "hook lost; rescan failed -- wait and retry");
+        }
         return 1;
     }
 

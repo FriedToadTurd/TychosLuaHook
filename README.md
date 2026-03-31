@@ -1,5 +1,4 @@
 # Poker Night Lua Hook via dinput8 Proxy Architecture
-Binary release can be downloaded on [Nexusmods](https://www.nexusmods.com/pokernightattheinventory/mods/17)
 
 ## How the DLL Gets Loaded
 
@@ -52,16 +51,18 @@ make
 DllMain (loader thread)
 └── CreateThread → worker_thread
     ├── Sleep(500ms)              let DllMain return before doing work
-    ├── scan_for_lua_state()      find the game's lua_State* in memory
+    ├── scan_for_lua_state()      retries every 500ms for up to 15s (30 attempts)
     ├── lua_sethook(count_hook, LUA_MASKCOUNT, 100)
     └── console_repl()            blocking REPL loop on this thread
         ├── AllocConsole()
+        ├── ShowWindow / SetForegroundWindow   force visible on Windows 11
         ├── freopen("CONIN$", "r", stdin)
         ├── freopen("CONOUT$", "w", stdout)
         └── fgets loop
 
 count_hook (game's Lua thread, every 100 VM instructions)
-    reads g_pending_code, executes, writes g_result, sets g_result_ready
+    increments g_hook_heartbeat, then if g_code_pending:
+    walks call stack for _ENV, executes, writes g_result, sets g_result_ready
 ```
 
 ### Export Forwarding
@@ -86,7 +87,7 @@ The real `C:\Windows\System32\dinput8.dll` is loaded by full absolute path at th
 
 `CelebrityPoker.exe` embeds a Lua 5.2.3 interpreter. The `lua_State*` is stored somewhere in the game's writable data sections but its address is not exported.
 
-`scan_for_lua_state()` walks all writable, non-executable PE sections of the game image and tests each 8-byte-aligned pointer against the `lua_State` struct layout:
+`scan_for_lua_state()` walks all writable, non-executable PE sections of the game image and tests each 8-byte-aligned pointer against the `lua_State` struct layout. Because the game initialises its Lua VM some time after the DLL loads, the worker thread retries the scan every 500ms for up to 15 seconds (30 attempts) before giving up.
 
 | Offset | Field | Validation |
 |---|---|---|
@@ -118,11 +119,16 @@ This eliminates the need for `SuspendThread` and avoids all VM thread-safety iss
 
 Telltale runs game scripts in a sandboxed `_ENV` table, not in `_G`. `luaL_loadstring` sets the chunk's `_ENV` to `_G` by default, so game globals (`GameObject`, `kPlayer_Player`, etc.) would be invisible.
 
-Fix: `count_hook` retrieves the `_ENV` upvalue from the currently-executing game function (`lua_getstack(L,1)` → `lua_getinfo(L,"f")` → `lua_getupvalue(L,-1,1)`) and replaces the compiled chunk's `_ENV` with it before calling `lua_pcall`.
+Fix: `count_hook` walks up to 5 levels of the Lua call stack looking for the innermost frame whose first upvalue is named `_ENV`, then replaces the compiled chunk's `_ENV` with that value before calling `lua_pcall`. Walking the stack (rather than always using level 1) is necessary because the game sometimes interposes callback wrapper frames — e.g. a frame whose first upvalue is `bRunningCallbacks` — between the hook firing point and the outer game chunk that actually holds `_ENV`. If no `_ENV` is found anywhere in the stack, execution proceeds with `_G`; commands guarded by `if GameObject then` no-op safely in that case.
 
 ### Hook Loss Recovery
 
-When a new poker game starts, the game re-initialises its Lua state, clearing any installed hook. `exec_lua()` detects this via timeout and automatically calls `rescan_and_rehook()`, which rescans memory for the new `lua_State*`, reinstalls the hook, and returns `ERR: hook lost; reconnected -- retry`. The user retries the command once.
+When a new poker game starts, the game re-initialises its Lua state, clearing any installed hook. `exec_lua()` detects this via a 5-second timeout and needs to distinguish two failure modes:
+
+- **Hook truly lost** (heartbeat unchanged during the wait): the hook stopped firing entirely — the `lua_State` was reset. `exec_lua()` calls `rescan_and_rehook()`, which rescans memory for the new `lua_State*`, reinstalls the hook, and returns `ERR: hook lost; reconnected -- retry`. The user retries the command once.
+- **Hook alive but context-busy** (heartbeat advancing but no result): the hook is firing on every invocation but the call stack currently has no `_ENV`-bearing frame to execute against. `exec_lua()` returns `ERR: hook busy (wrong context); retry shortly` without triggering a rescan.
+
+`g_hook_heartbeat` is a `volatile LONG` incremented on every hook invocation regardless of whether a command is pending. It is only ever compared across a ~5-second window, so integer overflow is not a concern.
 
 The `rehook` REPL command forces an immediate rescan without waiting for a timeout.
 
